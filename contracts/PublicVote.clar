@@ -11,6 +11,9 @@
 (define-constant ERR_PROPOSAL_NOT_APPROVED (err u108))
 (define-constant ERR_VOTER_NOT_REGISTERED (err u109))
 (define-constant ERR_VOTER_ALREADY_REGISTERED (err u110))
+(define-constant ERR_ALREADY_CANCELLED (err u111))
+(define-constant ERR_CANNOT_CANCEL_EXECUTED (err u112))
+(define-constant ERR_INVALID_CANCELLATION (err u113))
 
 (define-data-var proposal-counter uint u0)
 (define-data-var total-budget uint u1000000000)
@@ -50,6 +53,11 @@
 (define-map budget-allocations
   { proposal-id: uint }
   { allocated-amount: uint, disbursed: bool }
+)
+
+(define-map proposal-cancellations
+  { proposal-id: uint }
+  { cancelled: bool, cancelled-by: principal, cancellation-reason: (string-ascii 256), cancelled-at-block: uint }
 )
 
 (define-read-only (get-proposal (proposal-id uint))
@@ -116,6 +124,19 @@
   )
 )
 
+(define-read-only (get-cancellation-status (proposal-id uint))
+  (map-get? proposal-cancellations { proposal-id: proposal-id })
+)
+
+(define-read-only (is-proposal-cancelled (proposal-id uint))
+  (let ((cancellation (map-get? proposal-cancellations { proposal-id: proposal-id })))
+    (match cancellation
+      cancel-data (get cancelled cancel-data)
+      false
+    )
+  )
+)
+
 (define-public (register-voter)
   (let ((caller tx-sender))
     (asserts! (not (is-voter-registered caller)) ERR_VOTER_ALREADY_REGISTERED)
@@ -170,6 +191,7 @@
       (current-votes-against (get votes-against proposal))
     )
     (asserts! (is-voter-registered caller) ERR_VOTER_NOT_REGISTERED)
+    (asserts! (not (is-proposal-cancelled proposal-id)) ERR_ALREADY_CANCELLED)
     (asserts! (<= stacks-block-height (get voting-end proposal)) ERR_VOTING_PERIOD_ENDED)
     (asserts! (not (has-voted proposal-id caller)) ERR_ALREADY_VOTED)
     
@@ -197,6 +219,7 @@
 (define-public (execute-proposal (proposal-id uint))
   (let ((proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR_PROPOSAL_NOT_FOUND)))
     (asserts! (is-eq tx-sender (var-get admin)) ERR_NOT_AUTHORIZED)
+    (asserts! (not (is-proposal-cancelled proposal-id)) ERR_ALREADY_CANCELLED)
     (asserts! (> stacks-block-height (get voting-end proposal)) ERR_VOTING_PERIOD_NOT_ENDED)
     (asserts! (not (get executed proposal)) ERR_PROPOSAL_ALREADY_EXECUTED)
     
@@ -276,6 +299,42 @@
     (asserts! (is-eq tx-sender (var-get admin)) ERR_NOT_AUTHORIZED)
     (var-set admin new-admin)
     (ok new-admin)
+  )
+)
+
+(define-public (withdraw-proposal (proposal-id uint) (reason (string-ascii 256)))
+  (let
+    (
+      (caller tx-sender)
+      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR_PROPOSAL_NOT_FOUND))
+      (is-cancelled (is-proposal-cancelled proposal-id))
+    )
+    (asserts! (is-eq caller (get proposer proposal)) ERR_NOT_AUTHORIZED)
+    (asserts! (not (get executed proposal)) ERR_CANNOT_CANCEL_EXECUTED)
+    (asserts! (not is-cancelled) ERR_ALREADY_CANCELLED)
+    (map-set proposal-cancellations
+      { proposal-id: proposal-id }
+      { cancelled: true, cancelled-by: caller, cancellation-reason: reason, cancelled-at-block: stacks-block-height }
+    )
+    (var-set total-budget (+ (var-get total-budget) (get budget-requested proposal)))
+    (ok true)
+  )
+)
+
+(define-public (veto-proposal (proposal-id uint) (reason (string-ascii 256)))
+  (let
+    (
+      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR_PROPOSAL_NOT_FOUND))
+      (is-cancelled (is-proposal-cancelled proposal-id))
+    )
+    (asserts! (is-eq tx-sender (var-get admin)) ERR_NOT_AUTHORIZED)
+    (asserts! (not is-cancelled) ERR_ALREADY_CANCELLED)
+    (map-set proposal-cancellations
+      { proposal-id: proposal-id }
+      { cancelled: true, cancelled-by: tx-sender, cancellation-reason: reason, cancelled-at-block: stacks-block-height }
+    )
+    (var-set total-budget (+ (var-get total-budget) (get budget-requested proposal)))
+    (ok true)
   )
 )
 
