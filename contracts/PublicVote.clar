@@ -14,6 +14,11 @@
 (define-constant ERR_ALREADY_CANCELLED (err u111))
 (define-constant ERR_CANNOT_CANCEL_EXECUTED (err u112))
 (define-constant ERR_INVALID_CANCELLATION (err u113))
+(define-constant ERR_DELEGATION_NOT_FOUND (err u114))
+(define-constant ERR_DELEGATION_ALREADY_EXISTS (err u115))
+(define-constant ERR_INVALID_DELEGATION_TARGET (err u116))
+(define-constant ERR_DELEGATION_WITHDRAWN (err u117))
+(define-constant ERR_ABSTENTION_ALREADY_CAST (err u118))
 
 (define-data-var proposal-counter uint u0)
 (define-data-var total-budget uint u1000000000)
@@ -58,6 +63,21 @@
 (define-map proposal-cancellations
   { proposal-id: uint }
   { cancelled: bool, cancelled-by: principal, cancellation-reason: (string-ascii 256), cancelled-at-block: uint }
+)
+
+(define-map voter-delegations
+  { delegator: principal, proposal-id: uint }
+  { delegatee: principal, delegation-block: uint, is-active: bool }
+)
+
+(define-map abstention-votes
+  { proposal-id: uint, voter: principal }
+  { abstained: bool, block-height: uint }
+)
+
+(define-map proposal-abstentions
+  { proposal-id: uint }
+  { total-abstentions: uint }
 )
 
 (define-read-only (get-proposal (proposal-id uint))
@@ -137,6 +157,37 @@
   )
 )
 
+(define-read-only (get-delegation (delegator principal) (proposal-id uint))
+  (map-get? voter-delegations { delegator: delegator, proposal-id: proposal-id })
+)
+
+(define-read-only (is-abstention-voter (proposal-id uint) (voter principal))
+  (let ((abstention (map-get? abstention-votes { proposal-id: proposal-id, voter: voter })))
+    (match abstention
+      abs-data (get abstained abs-data)
+      false
+    )
+  )
+)
+
+(define-read-only (get-delegated-vote-count (delegatee principal) (proposal-id uint))
+  (let ((delegation (map-get? voter-delegations { delegator: delegatee, proposal-id: proposal-id })))
+    (match delegation
+      del-data (if (get is-active del-data) u1 u0)
+      u0
+    )
+  )
+)
+
+(define-read-only (get-proposal-abstention-count (proposal-id uint))
+  (let ((abstentions (map-get? proposal-abstentions { proposal-id: proposal-id })))
+    (match abstentions
+      abs-data (get total-abstentions abs-data)
+      u0
+    )
+  )
+)
+
 (define-public (register-voter)
   (let ((caller tx-sender))
     (asserts! (not (is-voter-registered caller)) ERR_VOTER_ALREADY_REGISTERED)
@@ -187,6 +238,9 @@
       (caller tx-sender)
       (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR_PROPOSAL_NOT_FOUND))
       (voter-power (calculate-voting-power caller))
+      (delegation (map-get? voter-delegations { delegator: caller, proposal-id: proposal-id }))
+      (delegated-weight (if (is-some delegation) u0 u0))
+      (total-weight (+ voter-power delegated-weight))
       (current-votes-for (get votes-for proposal))
       (current-votes-against (get votes-against proposal))
     )
@@ -194,10 +248,11 @@
     (asserts! (not (is-proposal-cancelled proposal-id)) ERR_ALREADY_CANCELLED)
     (asserts! (<= stacks-block-height (get voting-end proposal)) ERR_VOTING_PERIOD_ENDED)
     (asserts! (not (has-voted proposal-id caller)) ERR_ALREADY_VOTED)
+    (asserts! (not (is-abstention-voter proposal-id caller)) ERR_ABSTENTION_ALREADY_CAST)
     
     (map-set votes
       { proposal-id: proposal-id, voter: caller }
-      { vote: vote-for, weight: voter-power }
+      { vote: vote-for, weight: total-weight }
     )
     
     (map-set voter-proposals
@@ -205,11 +260,19 @@
       { voted: true }
     )
     
+    (if (is-some delegation)
+      (map-set voter-delegations
+        { delegator: caller, proposal-id: proposal-id }
+        (merge (unwrap! delegation ERR_DELEGATION_NOT_FOUND) { is-active: false })
+      )
+      true
+    )
+    
     (map-set proposals
       { proposal-id: proposal-id }
       (merge proposal {
-        votes-for: (if vote-for (+ current-votes-for voter-power) current-votes-for),
-        votes-against: (if vote-for current-votes-against (+ current-votes-against voter-power))
+        votes-for: (if vote-for (+ current-votes-for total-weight) current-votes-for),
+        votes-against: (if vote-for current-votes-against (+ current-votes-against total-weight))
       })
     )
     (ok true)
@@ -228,8 +291,8 @@
         (votes-for (get votes-for proposal))
         (votes-against (get votes-against proposal))
         (total-votes (+ votes-for votes-against))
-        (approval-threshold (/ total-votes u2))
-        (approved (> votes-for approval-threshold))
+        (approval-threshold (if (> total-votes u0) (/ total-votes u2) u0))
+        (approved (if (> total-votes u0) (> votes-for approval-threshold) false))
       )
       
       (map-set proposals
@@ -271,6 +334,79 @@
       (merge allocation { disbursed: true })
     )
     (ok (get allocated-amount allocation))
+  )
+)
+
+(define-public (delegate-vote (delegatee principal) (proposal-id uint))
+  (let
+    (
+      (caller tx-sender)
+      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR_PROPOSAL_NOT_FOUND))
+      (existing-delegation (map-get? voter-delegations { delegator: caller, proposal-id: proposal-id }))
+    )
+    (asserts! (is-voter-registered caller) ERR_VOTER_NOT_REGISTERED)
+    (asserts! (is-voter-registered delegatee) ERR_INVALID_DELEGATION_TARGET)
+    (asserts! (not (is-eq caller delegatee)) ERR_INVALID_DELEGATION_TARGET)
+    (asserts! (not (is-proposal-cancelled proposal-id)) ERR_ALREADY_CANCELLED)
+    (asserts! (<= stacks-block-height (get voting-end proposal)) ERR_VOTING_PERIOD_ENDED)
+    (asserts! (not (has-voted proposal-id caller)) ERR_ALREADY_VOTED)
+    (asserts! (is-none existing-delegation) ERR_DELEGATION_ALREADY_EXISTS)
+    
+    (map-set voter-delegations
+      { delegator: caller, proposal-id: proposal-id }
+      { delegatee: delegatee, delegation-block: stacks-block-height, is-active: true }
+    )
+    (ok true)
+  )
+)
+
+(define-public (revoke-delegation (proposal-id uint))
+  (let
+    (
+      (caller tx-sender)
+      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR_PROPOSAL_NOT_FOUND))
+      (delegation (unwrap! (map-get? voter-delegations { delegator: caller, proposal-id: proposal-id }) ERR_DELEGATION_NOT_FOUND))
+    )
+    (asserts! (<= stacks-block-height (get voting-end proposal)) ERR_VOTING_PERIOD_ENDED)
+    (asserts! (get is-active delegation) ERR_DELEGATION_WITHDRAWN)
+    
+    (map-set voter-delegations
+      { delegator: caller, proposal-id: proposal-id }
+      (merge delegation { is-active: false })
+    )
+    (ok true)
+  )
+)
+
+(define-public (cast-abstention-vote (proposal-id uint))
+  (let
+    (
+      (caller tx-sender)
+      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR_PROPOSAL_NOT_FOUND))
+      (voter-power (calculate-voting-power caller))
+      (current-abstentions (get-proposal-abstention-count proposal-id))
+    )
+    (asserts! (is-voter-registered caller) ERR_VOTER_NOT_REGISTERED)
+    (asserts! (not (is-proposal-cancelled proposal-id)) ERR_ALREADY_CANCELLED)
+    (asserts! (<= stacks-block-height (get voting-end proposal)) ERR_VOTING_PERIOD_ENDED)
+    (asserts! (not (has-voted proposal-id caller)) ERR_ALREADY_VOTED)
+    (asserts! (not (is-abstention-voter proposal-id caller)) ERR_ABSTENTION_ALREADY_CAST)
+    
+    (map-set abstention-votes
+      { proposal-id: proposal-id, voter: caller }
+      { abstained: true, block-height: stacks-block-height }
+    )
+    
+    (map-set voter-proposals
+      { voter: caller, proposal-id: proposal-id }
+      { voted: true }
+    )
+    
+    (map-set proposal-abstentions
+      { proposal-id: proposal-id }
+      { total-abstentions: (+ current-abstentions voter-power) }
+    )
+    (ok true)
   )
 )
 
